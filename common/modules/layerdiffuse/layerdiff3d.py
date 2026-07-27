@@ -72,6 +72,30 @@ from utils.torch_utils import zero_module
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+def _module_execution_device(module: nn.Module, fallback: Optional[torch.device] = None) -> torch.device:
+    hf_hook = getattr(module, "_hf_hook", None)
+    device = getattr(hf_hook, "execution_device", None)
+    if device is not None:
+        return torch.device(device)
+
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return fallback if fallback is not None else torch.device("cpu")
+
+
+def _move_tensor_tree_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_tensor_tree_to_device(item, device) for item in value]
+    return value
+
+
 
 class UNetMidBlockCrossFrameAttn(nn.Module):
     def __init__(
@@ -523,7 +547,7 @@ def get_up_block(
     up_block_type: str,
     **kwargs
 ) -> nn.Module:
-    
+
     if up_block_type == "CrossFrameAttnUpBlock":
         return CrossFrameAttnUpBlock(**kwargs)
     else:
@@ -537,6 +561,8 @@ class GroupEmbedding(nn.Module):
         self.linear = nn.Linear(ndim, ndim)
 
     def forward(self, x: torch.Tensor):
+        if self.params.device != x.device:
+            self.to(device=x.device)
         if x.ndim == 3:
             x = x + self.params[:, None]
         else:
@@ -1439,6 +1465,8 @@ class UNetFrameConditionModel(
             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
+        else:
+            timesteps = timesteps.to(sample.device)
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
@@ -1617,6 +1645,26 @@ class UNetFrameConditionModel(
                 If `return_dict` is True, an [`~models.unets.unet_2d_condition.UNet2DConditionOutput`] is returned,
                 otherwise a `tuple` is returned where the first element is the sample tensor.
         """
+        execution_device = _module_execution_device(self, fallback=sample.device)
+        sample = _move_tensor_tree_to_device(sample, execution_device)
+        timestep = _move_tensor_tree_to_device(timestep, execution_device)
+        encoder_hidden_states = _move_tensor_tree_to_device(encoder_hidden_states, execution_device)
+        class_labels = _move_tensor_tree_to_device(class_labels, execution_device)
+        timestep_cond = _move_tensor_tree_to_device(timestep_cond, execution_device)
+        attention_mask = _move_tensor_tree_to_device(attention_mask, execution_device)
+        cross_attention_kwargs = _move_tensor_tree_to_device(cross_attention_kwargs, execution_device)
+        added_cond_kwargs = _move_tensor_tree_to_device(added_cond_kwargs, execution_device)
+        down_block_additional_residuals = _move_tensor_tree_to_device(
+            down_block_additional_residuals, execution_device
+        )
+        mid_block_additional_residual = _move_tensor_tree_to_device(
+            mid_block_additional_residual, execution_device
+        )
+        down_intrablock_additional_residuals = _move_tensor_tree_to_device(
+            down_intrablock_additional_residuals, execution_device
+        )
+        encoder_attention_mask = _move_tensor_tree_to_device(encoder_attention_mask, execution_device)
+
         # By default samples have to be AT least a multiple of the overall upsampling factor.
         # The overall upsampling factor is equal to 2 ** (# num of upsampling layers).
         # However, the upsampling interpolation output size can be forced to fit any upsampling size
@@ -1676,10 +1724,15 @@ class UNetFrameConditionModel(
 
         # 1. time
         t_emb = self.get_time_embed(sample=sample, timestep=timestep)
+        time_device = _module_execution_device(self.time_embedding, fallback=sample.device)
+        t_emb = t_emb.to(device=time_device)
+        if timestep_cond is not None:
+            timestep_cond = timestep_cond.to(device=time_device)
         emb = self.time_embedding(t_emb, timestep_cond)
 
         class_emb = self.get_class_embed(sample=sample, class_labels=class_labels)
         if class_emb is not None:
+            class_emb = class_emb.to(device=emb.device)
             if self.config.class_embeddings_concat:
                 emb = torch.cat([emb, class_emb], dim=-1)
             else:
@@ -1697,6 +1750,8 @@ class UNetFrameConditionModel(
             aug_emb, hint = aug_emb
             sample = torch.cat([sample, hint], dim=1)
 
+        if aug_emb is not None:
+            aug_emb = aug_emb.to(device=emb.device)
         emb = emb + aug_emb if aug_emb is not None else emb
 
         if self.time_embed_act is not None:

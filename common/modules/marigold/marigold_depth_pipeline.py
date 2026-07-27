@@ -27,6 +27,7 @@
 #   https://github.com/prs-eth/Marigold#-citation
 # If you find Marigold useful, we kindly ask you to cite our papers.
 # --------------------------------------------------------------------------
+import os
 import os.path as osp
 import gc
 import logging
@@ -80,12 +81,13 @@ def encode_rgb(vae, rgb_in: torch.Tensor, latent_scale_factor = 0.18215) -> torc
     return rgb_latent
 
 
-def encode_argb_list(vae, batched_img_list, dtype=torch.float32, pad_argb=False):
+def encode_argb_list(vae, batched_img_list, dtype=torch.float32, pad_argb=False, device=None):
     batched_latent_list = []
+    execution_device = torch.device(device) if device is not None else vae.device
     for img_list in batched_img_list:
         if pad_argb:
             img_list = pad_rgb_torch(img_list.float(), return_format='argb')
-        img_list = img_list.to(device=vae.device, dtype=vae.dtype)
+        img_list = img_list.to(device=execution_device, dtype=vae.dtype)
         rgb_in = img_list[:, 1:] * 2 - 1
         batched_latent_list.append(
             encode_rgb(vae, rgb_in).to(dtype=dtype)
@@ -130,7 +132,7 @@ def encode_empty_text():
     if osp.exists(cached_empty_text_tensor):
         empty_text_embed = load_file(cached_empty_text_tensor)['tensors']
         return empty_text_embed
-    
+
     text_encoder = CLIPTextModel.from_pretrained("prs-eth/marigold-depth-v1-1", subfolder="text_encoder")
     tokenizer = CLIPTokenizer.from_pretrained("prs-eth/marigold-depth-v1-1", subfolder="tokenizer")
 
@@ -144,7 +146,7 @@ def encode_empty_text():
     )
     text_input_ids = text_inputs.input_ids.to(text_encoder.device)
     empty_text_embed = text_encoder(text_input_ids)[0]
-    
+
     save_file({'tensors': empty_text_embed}, cached_empty_text_tensor)
 
     return empty_text_embed
@@ -311,16 +313,32 @@ class MarigoldDepthPipeline(DiffusionPipeline):
             img = np.concatenate([img[..., 3:], img[..., :3]], axis=2).astype(np.float32) / 255.
             img = img2tensor(img=img, dim_order='chw')
             return img
-        
+
         if img_list is not None:
             img_list_tensor = torch.stack([_np_transform(img) for img in img_list])
             cond_full_page = img_list_tensor[-1][None]
             ncls = img_list_tensor.shape[0]
+            execution_device = self._execution_device
             with torch.no_grad():
                 vae = self.vae
-                rgb_latent = [encode_argb_list(vae, img[None, None].to(device=vae.device, dtype=vae.dtype), pad_argb=True, dtype=vae.dtype) for img in img_list_tensor]
+                rgb_latent = [
+                    encode_argb_list(
+                        vae,
+                        img[None, None],
+                        pad_argb=True,
+                        dtype=vae.dtype,
+                        device=execution_device,
+                    )
+                    for img in img_list_tensor
+                ]
                 rgb_latent = torch.cat(rgb_latent, dim=1)
-                rgb_cond_latent = encode_argb_list(vae, cond_full_page[None], pad_argb=True, dtype=vae.dtype)
+                rgb_cond_latent = encode_argb_list(
+                    vae,
+                    cond_full_page[None],
+                    pad_argb=True,
+                    dtype=vae.dtype,
+                    device=execution_device,
+                )
                 rgb_latent = torch.cat(
                     [rgb_cond_latent.expand(-1, ncls, -1, -1, -1), rgb_latent], dim=2
                 )
@@ -437,7 +455,7 @@ class MarigoldDepthPipeline(DiffusionPipeline):
             pred_uncert = pred_uncert.squeeze().to(device='cpu', dtype=torch.float32).numpy()
 
         # Clip output range
-    
+
         # Colorize
         if color_map is not None:
             depth_colored = colorize_depth_maps(
@@ -515,6 +533,13 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         """
         Encode text embedding for empty prompt
         """
+        from safetensors.torch import load_file, save_file
+
+        cache_path = "workspace/empty_text_tensor.safetensors"
+        if osp.exists(cache_path):
+            self.empty_text_embed = load_file(cache_path, device="cpu")["tensors"].to(self.dtype)
+            return
+
         prompt = ""
         text_inputs = self.tokenizer(
             prompt,
@@ -525,6 +550,8 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         )
         text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
         self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
+        os.makedirs(osp.dirname(cache_path), exist_ok=True)
+        save_file({"tensors": self.empty_text_embed.to("cpu").contiguous()}, cache_path)
 
 
     @property
@@ -554,7 +581,8 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         """
 
         is_3d = isinstance(self.unet, UNetFrameConditionModel)
-        device = self.device
+        device = self._execution_device
+        cond_latent = cond_latent.to(device=device, dtype=self.unet.dtype)
         # rgb_in = rgb_in.to(device)
 
         # Set timesteps
@@ -591,7 +619,7 @@ class MarigoldDepthPipeline(DiffusionPipeline):
 
                 if is_3d:
                     unet_input = unet_input[None]
-            
+
                 # predict the noise residual
                 noise_pred = self.unet(
                     unet_input, t, encoder_hidden_states=batch_empty_text_embed
@@ -630,7 +658,7 @@ class MarigoldDepthPipeline(DiffusionPipeline):
             `torch.Tensor`: Image latent.
         """
         # encode
-        rgb_in = rgb_in.to(device=self.vae.device, dtype=self.vae.dtype)
+        rgb_in = rgb_in.to(device=self._execution_device, dtype=self.vae.dtype)
         h = self.vae.encoder(rgb_in)
         moments = self.vae.quant_conv(h)
         mean, logvar = torch.chunk(moments, 2, dim=1)
@@ -652,7 +680,7 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         # scale latent
         depth_latent = depth_latent / self.latent_scale_factor
         # decode
-        depth_latent = depth_latent.to(device=self.vae.device, dtype=self.vae.dtype)
+        depth_latent = depth_latent.to(device=self._execution_device, dtype=self.vae.dtype)
         z = self.vae.post_quant_conv(depth_latent)
         stacked = self.vae.decoder(z)
         # mean of output channels

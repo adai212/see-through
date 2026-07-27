@@ -237,7 +237,7 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
     def denoise_func(self, latents, add_text_embeds, add_time_ids, prompt_embeds, c_concat, num_inference_steps=50):
 
         # 4. Prepare timesteps
-        device = self.unet.device
+        device = self._execution_device
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, timesteps=None, sigmas=None
         )
@@ -307,7 +307,7 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             group_index=None
     ):
 
-        device = self.unet.device
+        device = self._execution_device
         dtype = self.unet.dtype
 
         if fullpage is not None:
@@ -330,9 +330,9 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
                 num_frames = len(prompt)
             if prompt_embeds is not None:
                 num_frames = len(prompt_embeds)
-            
+
         if initial_latent is None:
-            initial_latent = torch.zeros((batch_size, 4, lh, lw), device=self.unet.device, dtype=self.unet.dtype)
+            initial_latent = torch.zeros((batch_size, 4, lh, lw), device=device, dtype=self.unet.dtype)
 
         if is_3d and c_concat.ndim == 4:
             c_concat = c_concat[:, None].expand(-1, num_frames, -1, -1, -1)
@@ -419,6 +419,8 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
+                noise_pred = noise_pred.to(device=device)
+                latents = latents.to(device=device)
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                 if latents.dtype != latents_dtype:
@@ -436,7 +438,12 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
         if self.trans_vae is None:
             return latents
 
-        latents = latents.to(dtype=self.trans_vae.dtype, device=self.trans_vae.device) / self.vae.config.scaling_factor
+        decode_device = device
+        self.vae.to(device=decode_device)
+        self.trans_vae.to(device=decode_device)
+        latents = latents.to(dtype=self.trans_vae.dtype, device=decode_device) / self.vae.config.scaling_factor
+        if fullpage is not None and page_alpha is not None:
+            page_alpha = page_alpha.to(device=decode_device)
 
         vis_list = []
         res_list = []
@@ -445,5 +452,10 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             result_list, vis_list_batch = self.trans_vae.decoder(self.vae, latent, mask=page_alpha)
             vis_list += vis_list_batch
             res_list += result_list
+
+        if hasattr(self.vae, '_hf_hook') or hasattr(self.trans_vae, '_hf_hook'):
+            self.vae.to("cpu")
+            self.trans_vae.to("cpu")
+            torch.cuda.empty_cache()
 
         return LayerdiffPipelineOutput(images=res_list, vis_list=vis_list)

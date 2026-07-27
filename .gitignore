@@ -2,6 +2,7 @@
 hf_credential
 *.token
 .env
+.venv
 .env.*
 !*.example
 

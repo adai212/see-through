@@ -21,10 +21,29 @@ os.environ['OMP_NUM_THREADS'] = f"{default_n_threads}"
 
 import json
 import time
+import gc
 import cv2
 import numpy as np
 import torch
 from PIL import Image
+
+
+def _configure_bitsandbytes_backend():
+    """Avoid the bitsandbytes CUDA 12.8 backend on Pascal GPUs.
+
+    On GTX 10-series cards (sm_61), bitsandbytes 0.49.2 can import with the
+    CUDA 12.8 DLL but fail later in NF4 kernels with "named symbol not found".
+    The CUDA 12.6 backend is compatible on this machine and still works with
+    the PyTorch cu128 wheel.
+    """
+    if os.environ.get('BNB_CUDA_VERSION') or not torch.cuda.is_available():
+        return
+    major, _minor = torch.cuda.get_device_capability(0)
+    if major < 7 and torch.version.cuda == '12.8':
+        os.environ['BNB_CUDA_VERSION'] = '126'
+
+
+_configure_bitsandbytes_backend()
 
 from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline
 from modules.layerdiffuse.vae import TransparentVAE
@@ -61,6 +80,7 @@ def build_layerdiff_pipeline(args):
             pipeline.unet.to(dtype=torch.bfloat16)
             pipeline.text_encoder.to(dtype=torch.bfloat16)
             pipeline.text_encoder_2.to(dtype=torch.bfloat16)
+            pipeline.cache_tag_embeds(unload_textencoders=False)
             pipeline.enable_model_cpu_offload()
         else:
             pipeline.vae.to(dtype=torch.bfloat16, device='cuda')
@@ -70,8 +90,8 @@ def build_layerdiff_pipeline(args):
             pipeline.text_encoder_2.to(dtype=torch.bfloat16, device='cuda')
             if getattr(args, 'group_offload', False):
                 pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
-        # Cache tag embeddings and unload text encoders to save VRAM
-        pipeline.cache_tag_embeds()
+            # Cache tag embeddings and unload text encoders to save VRAM.
+            pipeline.cache_tag_embeds()
     else:
         # NF4: load from pre-quantized repo (auto-selected by REPO_MAP)
         repo = args.repo_id_layerdiff
@@ -85,6 +105,7 @@ def build_layerdiff_pipeline(args):
             # VAE + TransparentVAE to bf16; quantized components handled by bnb
             pipeline.vae.to(dtype=torch.bfloat16)
             pipeline.trans_vae.to(dtype=torch.bfloat16)
+            pipeline.cache_tag_embeds(unload_textencoders=False)
             pipeline.enable_model_cpu_offload()
         else:
             pipeline.vae.to(dtype=torch.bfloat16, device='cuda')
@@ -92,8 +113,8 @@ def build_layerdiff_pipeline(args):
             # Don't manually .to(cuda) quantized components -- bnb handles device placement
             if getattr(args, 'group_offload', False):
                 pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
-        # Cache tag embeddings and unload text encoders to save VRAM
-        pipeline.cache_tag_embeds()
+            # Cache tag embeddings and unload text encoders to save VRAM.
+            pipeline.cache_tag_embeds()
 
     return pipeline
 
@@ -106,6 +127,8 @@ def build_marigold_pipeline(args):
         repo = args.repo_id_depth
         unet = UNetFrameConditionModel.from_pretrained(repo, subfolder='unet')
         marigold_pipe = MarigoldDepthPipeline.from_pretrained(repo, unet=unet)
+        marigold_pipe.text_encoder.to(device='cpu')
+        marigold_pipe.cache_tag_embeds()
         if args.cpu_offload:
             marigold_pipe.to(dtype=torch.bfloat16)
             marigold_pipe.enable_model_cpu_offload()
@@ -113,22 +136,41 @@ def build_marigold_pipeline(args):
             marigold_pipe.to(device='cuda', dtype=torch.bfloat16)
             if getattr(args, 'group_offload', False):
                 marigold_pipe.enable_group_offload('cuda', num_blocks_per_group=1)
-        marigold_pipe.cache_tag_embeds()
     else:
         # NF4: load from pre-quantized repo (auto-selected by REPO_MAP)
         repo = args.repo_id_depth
-        unet = UNetFrameConditionModel.from_pretrained(repo, subfolder='unet', torch_dtype=torch.bfloat16)
+        major, _minor = torch.cuda.get_device_capability(0)
+        marigold_dtype = torch.float16 if major < 8 else torch.bfloat16
+        if marigold_dtype == torch.float16:
+            print('Pascal GPU detected; using FP16 Marigold attention.')
+        unet = UNetFrameConditionModel.from_pretrained(
+            repo, subfolder='unet', torch_dtype=marigold_dtype
+        )
 
-        marigold_pipe = MarigoldDepthPipeline.from_pretrained(repo, unet=unet, torch_dtype=torch.bfloat16)
-        marigold_pipe.vae.to(device='cuda')
+        marigold_pipe = MarigoldDepthPipeline.from_pretrained(
+            repo, unet=unet, torch_dtype=marigold_dtype
+        )
+        from bitsandbytes.nn import Linear4bit
+        for module in marigold_pipe.unet.modules():
+            if isinstance(module, Linear4bit):
+                module.compute_dtype = marigold_dtype
+                module.compute_type_is_set = True
+        # Pascal CUDA can fail inside the quantized CLIP SDPA path. This
+        # one-time embedding is tiny, so compute and cache it on CPU.
+        if not osp.isfile('workspace/empty_text_tensor.safetensors'):
+            print('Caching Marigold empty-text embedding on CPU...')
+        marigold_pipe.text_encoder.to(device='cpu')
+        marigold_pipe.cache_tag_embeds()
+        marigold_pipe.vae.to(device='cuda', dtype=marigold_dtype)
         marigold_pipe.unet.to(device='cuda')
+        if getattr(args, 'group_offload', False) and getattr(
+            marigold_pipe.unet, 'is_loaded_in_4bit', False
+        ):
+            print('NF4 Marigold detected; disabling incompatible group offload.')
+            args.group_offload = False
         # Text encoder may be quantized (from pre-quantized repo) — only move device, not dtype
-        if not getattr(marigold_pipe.text_encoder, 'is_quantized', False) and \
-           not getattr(marigold_pipe.text_encoder, 'quantization_method', None):
-            marigold_pipe.text_encoder.to(device='cuda')
         if getattr(args, 'group_offload', False):
             marigold_pipe.enable_group_offload('cuda', num_blocks_per_group=1)
-        marigold_pipe.cache_tag_embeds()
 
     return marigold_pipe
 
@@ -358,6 +400,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_inference_steps', type=int, default=30)
     parser.add_argument('--resolution_depth', type=int, default=768,
                         help='Marigold depth inference resolution (default 768; -1 to match layerdiff resolution)')
+    parser.add_argument('--skip_layerdiff', action='store_true',
+                        help='reuse existing layer PNG files and start from Marigold')
     parser.add_argument('--group_offload', action='store_true', default=True,
                         help='Enable group offload to reduce peak VRAM (default: on)')
     parser.add_argument('--no_group_offload', action='store_false', dest='group_offload',
@@ -380,6 +424,11 @@ if __name__ == '__main__':
         args.repo_id_layerdiff = defaults['layerdiff']
     if args.repo_id_depth is None:
         args.repo_id_depth = defaults['depth']
+    if args.quant_mode == 'nf4' and torch.cuda.is_available():
+        major, _minor = torch.cuda.get_device_capability(0)
+        if major < 7 and not args.cpu_offload:
+            print('Pascal GPU detected; enabling CPU offload for NF4 inference.')
+            args.cpu_offload = True
 
     srcp = args.srcp
     seed = args.seed
@@ -398,19 +447,29 @@ if __name__ == '__main__':
     total_t0 = time.time()
 
     # --- LayerDiff ---
-    print('\nBuilding LayerDiff3D pipeline...')
-    seed_everything(seed)
-    pipeline = build_layerdiff_pipeline(args)
+    layerdiff_time = 0.0
+    if args.skip_layerdiff:
+        existing_source = osp.join(saved, 'src_img.png')
+        if not osp.isfile(existing_source):
+            raise FileNotFoundError(
+                f'Cannot skip LayerDiff: expected existing output at {existing_source}'
+            )
+        print(f'\nSkipping LayerDiff3D; reusing {saved}')
+    else:
+        print('\nBuilding LayerDiff3D pipeline...')
+        seed_everything(seed)
+        pipeline = build_layerdiff_pipeline(args)
 
-    print('Running LayerDiff3D (body + head)...')
-    layerdiff_t0 = time.time()
-    run_layerdiff(pipeline, srcp, save_dir, seed, num_inference_steps, resolution)
-    layerdiff_time = time.time() - layerdiff_t0
-    print(f'  LayerDiff3D done in {layerdiff_time:.1f}s')
+        print('Running LayerDiff3D (body + head)...')
+        layerdiff_t0 = time.time()
+        run_layerdiff(pipeline, srcp, save_dir, seed, num_inference_steps, resolution)
+        layerdiff_time = time.time() - layerdiff_t0
+        print(f'  LayerDiff3D done in {layerdiff_time:.1f}s')
 
-    # Free layerdiff pipeline before loading marigold
-    del pipeline
-    torch.cuda.empty_cache()
+        # Free layerdiff pipeline before loading marigold
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # --- Marigold ---
     print('\nBuilding Marigold depth pipeline...')
@@ -424,6 +483,7 @@ if __name__ == '__main__':
 
     # Free marigold pipeline before PSD assembly
     del marigold_pipe
+    gc.collect()
     torch.cuda.empty_cache()
 
     # --- PSD assembly ---
