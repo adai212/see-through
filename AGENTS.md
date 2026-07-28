@@ -78,6 +78,7 @@ Low-VRAM PSD inference:
 ```powershell
 cd D:\AI\seeThrough
 .\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image.png --save_to_psd --tblr_split --resolution 1024
+.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image.png --save_to_psd --tblr_split --resolution 768 --resolution_depth 512 --no_cpu_offload --no_group_offload
 ```
 
 On this GTX 1070 machine, `inference/scripts/inference_psd_quantized.py` has a local compatibility patch:

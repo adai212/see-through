@@ -410,9 +410,9 @@ if __name__ == '__main__':
         args.repo_id_depth = defaults['depth']
     if args.quant_mode == 'nf4' and torch.cuda.is_available():
         major, _minor = torch.cuda.get_device_capability(0)
-        if major < 7 and not args.cpu_offload:
-            print('Pascal GPU detected; enabling CPU offload for NF4 inference.')
-            args.cpu_offload = True
+#         if major < 7 and not args.cpu_offload:
+#             print('Pascal GPU detected; enabling CPU offload for NF4 inference.')
+#             args.cpu_offload = True
 
     srcp = args.srcp
     seed = args.seed
