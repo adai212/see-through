@@ -77,9 +77,14 @@ Low-VRAM PSD inference:
 
 ```powershell
 cd D:\AI\seeThrough
-.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image.png --save_to_psd --tblr_split --resolution 1024
-.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image.png --save_to_psd --tblr_split --resolution 768 --resolution_depth 512 --no_cpu_offload --no_group_offload
-.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image.png --save_to_psd --tblr_split --resolution 640 --resolution_depth 384 --no_cpu_offload --no_group_offload
+测试人物分块+合并psd
+.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized_two_stage.py
+原始测试命令
+.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image5.png --save_to_psd --tblr_split --resolution 1024
+测试人物分块
+.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image5.png --save_to_psd --tblr_split --resolution 768 --resolution_depth 512 --no_cpu_offload --no_group_offload
+测试合并psd
+.\.venv\Scripts\python.exe inference\scripts\inference_psd_quantized.py --srcp assets\test_image5.png --save_to_psd --tblr_split --resolution 640 --resolution_depth 384 --skip_layerdiff --no_cpu_offload --no_group_offload
 ```
 
 On this GTX 1070 machine, `inference/scripts/inference_psd_quantized.py` has a local compatibility patch:

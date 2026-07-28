@@ -386,6 +386,10 @@ if __name__ == '__main__':
                         help='Marigold depth inference resolution (default 768; -1 to match layerdiff resolution)')
     parser.add_argument('--skip_layerdiff', action='store_true',
                         help='reuse existing layer PNG files and start from Marigold')
+    parser.add_argument('--skip_marigold', action='store_true',
+                        help='skip Marigold depth generation')
+    parser.add_argument('--skip_psd', action='store_true',
+                        help='skip PSD assembly after writing layer and depth PNG files')
     parser.add_argument('--group_offload', action='store_true', default=True,
                         help='Enable group offload to reduce peak VRAM (default: on)')
     parser.add_argument('--no_group_offload', action='store_false', dest='group_offload',
@@ -456,26 +460,34 @@ if __name__ == '__main__':
         torch.cuda.empty_cache()
 
     # --- Marigold ---
-    print('\nBuilding Marigold depth pipeline...')
-    marigold_pipe = build_marigold_pipeline(args)
+    marigold_time = 0.0
+    if args.skip_marigold:
+        print('\nSkipping Marigold depth generation.')
+    else:
+        print('\nBuilding Marigold depth pipeline...')
+        marigold_pipe = build_marigold_pipeline(args)
 
-    print('Running Marigold depth...')
-    marigold_t0 = time.time()
-    run_marigold(marigold_pipe, srcp, save_dir, seed, resolution_depth=args.resolution_depth)
-    marigold_time = time.time() - marigold_t0
-    print(f'  Marigold done in {marigold_time:.1f}s')
+        print('Running Marigold depth...')
+        marigold_t0 = time.time()
+        run_marigold(marigold_pipe, srcp, save_dir, seed, resolution_depth=args.resolution_depth)
+        marigold_time = time.time() - marigold_t0
+        print(f'  Marigold done in {marigold_time:.1f}s')
 
-    # Free marigold pipeline before PSD assembly
-    del marigold_pipe
-    gc.collect()
-    torch.cuda.empty_cache()
+        # Free marigold pipeline before PSD assembly
+        del marigold_pipe
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # --- PSD assembly ---
-    print('\nRunning PSD assembly...')
-    psd_t0 = time.time()
-    further_extr(saved, rotate=False, save_to_psd=args.save_to_psd, tblr_split=args.tblr_split)
-    psd_time = time.time() - psd_t0
-    print(f'  PSD assembly done in {psd_time:.1f}s')
+    psd_time = 0.0
+    if args.skip_psd:
+        print('\nSkipping PSD assembly. Run assemble_psd.py in a fresh process to build the PSD.')
+    else:
+        print('\nRunning PSD assembly...')
+        psd_t0 = time.time()
+        further_extr(saved, rotate=False, save_to_psd=args.save_to_psd, tblr_split=args.tblr_split)
+        psd_time = time.time() - psd_t0
+        print(f'  PSD assembly done in {psd_time:.1f}s')
 
     total_time = time.time() - total_t0
 
