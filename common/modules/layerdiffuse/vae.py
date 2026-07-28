@@ -234,18 +234,9 @@ class TransparentVAEDecoder(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, sd_vae, latent, return_type='numpy', rgb_cond=None, mask=None, return_rgb=False):
-        vae_device = _module_execution_device(sd_vae)
-        latent = latent.to(device=vae_device, dtype=sd_vae.dtype)
         pixel = sd_vae.decode(latent).sample
         pixel = (pixel * 0.5 + 0.5).to(self.dtype)
         latent = latent.to(self.dtype)
-        decoder_device = _module_execution_device(self)
-        pixel = pixel.to(decoder_device)
-        latent = latent.to(decoder_device)
-        if rgb_cond is not None:
-            rgb_cond = rgb_cond.to(decoder_device)
-        if mask is not None:
-            mask = mask.to(decoder_device)
         result_list = []
         vis_list = []
 
@@ -343,23 +334,9 @@ class TransparentVAE(ModelMixin, ConfigMixin):
 
 
 
-
-
-def _module_execution_device(module):
-    hf_hook = getattr(module, '_hf_hook', None)
-    device = getattr(hf_hook, 'execution_device', None)
-    if device is not None:
-        return device
-    try:
-        return next(module.parameters()).device
-    except StopIteration:
-        return module.device
-
-
 @torch.inference_mode()
 def vae_encode(vae, trans_vae_encoder: TransparentVAEEncoder, argb_tensor: torch.Tensor, use_offset=True, scale=True) -> torch.Tensor:
-    device = _module_execution_device(vae)
-    latent = trans_vae_encoder.encode(argb_tensor.to(dtype=vae.dtype, device=device), vae, use_offset=use_offset)
+    latent = trans_vae_encoder.encode(argb_tensor.to(dtype=vae.dtype, device=vae.device), vae, use_offset=use_offset)
     if scale:
         latent = latent * vae.config.scaling_factor
     return latent

@@ -127,8 +127,6 @@ def build_marigold_pipeline(args):
         repo = args.repo_id_depth
         unet = UNetFrameConditionModel.from_pretrained(repo, subfolder='unet')
         marigold_pipe = MarigoldDepthPipeline.from_pretrained(repo, unet=unet)
-        marigold_pipe.text_encoder.to(device='cpu')
-        marigold_pipe.cache_tag_embeds()
         if args.cpu_offload:
             marigold_pipe.to(dtype=torch.bfloat16)
             marigold_pipe.enable_model_cpu_offload()
@@ -136,41 +134,27 @@ def build_marigold_pipeline(args):
             marigold_pipe.to(device='cuda', dtype=torch.bfloat16)
             if getattr(args, 'group_offload', False):
                 marigold_pipe.enable_group_offload('cuda', num_blocks_per_group=1)
+        marigold_pipe.cache_tag_embeds()
     else:
         # NF4: load from pre-quantized repo (auto-selected by REPO_MAP)
         repo = args.repo_id_depth
-        major, _minor = torch.cuda.get_device_capability(0)
-        marigold_dtype = torch.float16 if major < 8 else torch.bfloat16
-        if marigold_dtype == torch.float16:
-            print('Pascal GPU detected; using FP16 Marigold attention.')
-        unet = UNetFrameConditionModel.from_pretrained(
-            repo, subfolder='unet', torch_dtype=marigold_dtype
-        )
+        unet = UNetFrameConditionModel.from_pretrained(repo, subfolder='unet', torch_dtype=torch.bfloat16)
 
-        marigold_pipe = MarigoldDepthPipeline.from_pretrained(
-            repo, unet=unet, torch_dtype=marigold_dtype
-        )
-        from bitsandbytes.nn import Linear4bit
-        for module in marigold_pipe.unet.modules():
-            if isinstance(module, Linear4bit):
-                module.compute_dtype = marigold_dtype
-                module.compute_type_is_set = True
-        # Pascal CUDA can fail inside the quantized CLIP SDPA path. This
-        # one-time embedding is tiny, so compute and cache it on CPU.
-        if not osp.isfile('workspace/empty_text_tensor.safetensors'):
-            print('Caching Marigold empty-text embedding on CPU...')
-        marigold_pipe.text_encoder.to(device='cpu')
-        marigold_pipe.cache_tag_embeds()
-        marigold_pipe.vae.to(device='cuda', dtype=marigold_dtype)
+        marigold_pipe = MarigoldDepthPipeline.from_pretrained(repo, unet=unet, torch_dtype=torch.bfloat16)
+        marigold_pipe.vae.to(device='cuda')
         marigold_pipe.unet.to(device='cuda')
         if getattr(args, 'group_offload', False) and getattr(
             marigold_pipe.unet, 'is_loaded_in_4bit', False
         ):
             print('NF4 Marigold detected; disabling incompatible group offload.')
             args.group_offload = False
-        # Text encoder may be quantized (from pre-quantized repo) — only move device, not dtype
+        # Text encoder may be quantized (from pre-quantized repo) - only move device, not dtype
+        if not getattr(marigold_pipe.text_encoder, 'is_quantized', False) and \
+           not getattr(marigold_pipe.text_encoder, 'quantization_method', None):
+            marigold_pipe.text_encoder.to(device='cuda')
         if getattr(args, 'group_offload', False):
             marigold_pipe.enable_group_offload('cuda', num_blocks_per_group=1)
+        marigold_pipe.cache_tag_embeds()
 
     return marigold_pipe
 

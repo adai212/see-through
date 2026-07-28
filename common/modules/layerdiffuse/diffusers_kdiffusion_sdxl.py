@@ -438,12 +438,7 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
         if self.trans_vae is None:
             return latents
 
-        decode_device = device
-        self.vae.to(device=decode_device)
-        self.trans_vae.to(device=decode_device)
-        latents = latents.to(dtype=self.trans_vae.dtype, device=decode_device) / self.vae.config.scaling_factor
-        if fullpage is not None and page_alpha is not None:
-            page_alpha = page_alpha.to(device=decode_device)
+        latents = latents.to(dtype=self.trans_vae.dtype, device=self.trans_vae.device) / self.vae.config.scaling_factor
 
         vis_list = []
         res_list = []
@@ -452,10 +447,5 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             result_list, vis_list_batch = self.trans_vae.decoder(self.vae, latent, mask=page_alpha)
             vis_list += vis_list_batch
             res_list += result_list
-
-        if hasattr(self.vae, '_hf_hook') or hasattr(self.trans_vae, '_hf_hook'):
-            self.vae.to("cpu")
-            self.trans_vae.to("cpu")
-            torch.cuda.empty_cache()
 
         return LayerdiffPipelineOutput(images=res_list, vis_list=vis_list)

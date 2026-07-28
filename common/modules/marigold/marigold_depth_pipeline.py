@@ -533,13 +533,6 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         """
         Encode text embedding for empty prompt
         """
-        from safetensors.torch import load_file, save_file
-
-        cache_path = "workspace/empty_text_tensor.safetensors"
-        if osp.exists(cache_path):
-            self.empty_text_embed = load_file(cache_path, device="cpu")["tensors"].to(self.dtype)
-            return
-
         prompt = ""
         text_inputs = self.tokenizer(
             prompt,
@@ -550,8 +543,6 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         )
         text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
         self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
-        os.makedirs(osp.dirname(cache_path), exist_ok=True)
-        save_file({"tensors": self.empty_text_embed.to("cpu").contiguous()}, cache_path)
 
 
     @property
